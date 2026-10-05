@@ -1,0 +1,34 @@
+:root {
+  --bg: #fff; --fg: #1c1b22; --muted: #6b6a76; --line: #e3e2ea; --code: #f4f3f9; --accent: #5b3df5;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #121118; --fg: #e9e8f0; --muted: #9d9bab; --line: #2c2a38; --code: #1b1a24; --accent: #9b86ff; }
+}
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 16px/1.65 system-ui, -apple-system, 'Segoe UI', sans-serif; }
+.layout { display: flex; max-width: 1200px; margin: 0 auto; }
+.toc { position: sticky; top: 0; align-self: flex-start; width: 250px; height: 100vh; overflow: auto; padding: 32px 20px; flex: none; }
+.toc strong { display: block; margin-bottom: 12px; color: var(--accent); }
+.toc a { display: block; padding: 6px 0; color: var(--muted); text-decoration: none; font-size: 14px; }
+.toc a:hover { color: var(--accent); }
+.doc { flex: 1; min-width: 0; max-width: 900px; padding: 32px 24px 80px; }
+.doc h1 { font-size: 2rem; line-height: 1.2; margin: 0 0 .5em; }
+.doc h2 { margin-top: 2.4em; padding-top: .6em; border-top: 1px solid var(--line); scroll-margin-top: 16px; }
+.doc h3 { margin-top: 1.8em; }
+.doc a { color: var(--accent); }
+.doc code { background: var(--code); padding: .1em .35em; border-radius: 4px; font-size: .88em; }
+.doc pre { background: var(--code); padding: 16px; border-radius: 8px; overflow-x: auto; line-height: 1.5; }
+.doc pre code { background: none; padding: 0; font-size: .82rem; }
+.table-wrap { overflow-x: auto; }
+.doc table { border-collapse: collapse; font-size: .92rem; }
+.doc th, .doc td { border: 1px solid var(--line); padding: 8px 12px; text-align: left; vertical-align: top; }
+.doc th { background: var(--code); }
+.mermaid-box { border: 1px solid var(--line); border-radius: 8px; padding: 16px; overflow-x: auto; text-align: center; margin: 1em 0; }
+.mermaid-box svg { max-width: 100%; height: auto; }
+.muted { color: var(--muted); }
+@media (max-width: 860px) {
+  .toc { display: none; }
+  .doc { padding: 20px 16px 60px; }
+}
+@media print { .toc { display: none; } }
