@@ -1,0 +1,632 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mindstor Architecture and Repo Plan</title>
+<style>
+:root{--bg:#fff;--fg:#1c1b22;--mut:#6b6a76;--line:#e3e2ea;--code:#f4f3f9;--acc:#5b3df5}
+@media(prefers-color-scheme:dark){:root{--bg:#121118;--fg:#e9e8f0;--mut:#9d9bab;--line:#2c2a38;--code:#1b1a24;--acc:#9b86ff}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.65 system-ui,-apple-system,Segoe UI,sans-serif}
+.wrap{display:flex;max-width:1200px;margin:0 auto}
+nav{position:sticky;top:0;align-self:flex-start;width:240px;padding:32px 20px;height:100vh;overflow:auto;flex:none}
+nav b{display:block;margin-bottom:12px;color:var(--acc)}
+nav a{display:block;padding:6px 0;color:var(--mut);text-decoration:none;font-size:14px}
+nav a:hover{color:var(--acc)}
+main{padding:32px 24px 80px;min-width:0;flex:1;max-width:900px}
+h1{font-size:2rem;line-height:1.2;margin:0 0 .5em}
+h2{margin-top:2.4em;padding-top:.6em;border-top:1px solid var(--line)}
+h3{margin-top:1.8em}
+a{color:var(--acc)}
+code{background:var(--code);padding:.1em .35em;border-radius:4px;font-size:.88em}
+pre{background:var(--code);padding:16px;border-radius:8px;overflow-x:auto;line-height:1.5}
+pre code{background:none;padding:0;font-size:.82rem}
+pre.mermaid{background:transparent;text-align:center;border:1px solid var(--line)}
+table{border-collapse:collapse;display:block;overflow-x:auto;font-size:.92rem}
+th,td{border:1px solid var(--line);padding:8px 12px;text-align:left;vertical-align:top}
+th{background:var(--code)}
+@media(max-width:860px){nav{display:none}main{padding:20px 16px 60px}}
+@media print{nav{display:none}}
+</style></head><body>
+<div class="wrap"><nav><b>Contents</b><a href="#s0">0. Key decisions</a><a href="#s1">1. Architecture diagram</a><a href="#s2">2. Database schema (Supabase / Postgres)</a><a href="#s3">3. Manual seat sync fallback API (MVP)</a><a href="#s4">4. Monorepo structure (pnpm + Turborepo)</a><a href="#s5">5. Risks and mitigations</a></nav><main>
+<h1>Mindstor AI Cinephile Ticketing: System Architecture</h1>
+<h2 id="s0">0. Key decisions</h2>
+<table>
+<thead>
+<tr>
+<th>Area</th>
+<th>Choice</th>
+<th>Why</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Backend</td>
+<td><strong>Supabase</strong> (Postgres + Realtime + Auth + Edge Functions + Storage)</td>
+<td>Seat inventory, bookings and payments are relational and need transactions, constraints and row locks. Firestore handles this badly. Realtime covers chat and seat-map updates.</td>
+</tr>
+<tr>
+<td>Mobile</td>
+<td><strong>React Native (Expo)</strong></td>
+<td>Shares TypeScript and three.js code with the Next.js web app and the theatre portal. Flutter would force a second 3D codebase.</td>
+</tr>
+<tr>
+<td>3D seat view</td>
+<td>three.js in a shared <code>packages/seat-viewer</code>, rendered in a WebView on mobile and natively on web</td>
+<td>One implementation everywhere. Load a low-poly GLB per screen.</td>
+</tr>
+<tr>
+<td>Maps</td>
+<td>MapLibre GL (<code>@maplibre/maplibre-react-native</code>) with OSM data</td>
+<td>OSM's public tile servers prohibit heavy app traffic. Use Protomaps/PMTiles on Supabase Storage or Cloudflare R2, or a paid OSM tile host.</td>
+</tr>
+<tr>
+<td>Web / serverless</td>
+<td>Next.js on Vercel: marketing site, SEO movie pages, <strong>Theatre Partner Portal</strong>, payment webhooks</td>
+<td></td>
+</tr>
+<tr>
+<td>Auth</td>
+<td>Supabase Auth: Google OAuth + email magic link or password. SMS provider disabled.</td>
+<td>No SMS OTP cost.</td>
+</tr>
+<tr>
+<td>Payments</td>
+<td>Razorpay or Cashfree: UPI intent and collect as default, cards and netbanking as fallback</td>
+<td>Server-side order creation, signed webhook as the source of truth.</td>
+</tr>
+<tr>
+<td>AI mascot</td>
+<td>Edge Function proxy to an LLM (Claude API), with a per-user rate limit and retrieval over movie and screen data (pgvector)</td>
+<td>Keys never reach the client.</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Core principle:</strong> the database is the single source of truth for seat state. Every inventory source, whether direct API sync or manual, writes through the same RPC functions.</p>
+<h2 id="s1">1. Architecture diagram</h2>
+<pre class="mermaid">flowchart TB
+  subgraph Clients
+    RN[&quot;React Native App (Expo)&lt;br/&gt;Seat 2D map, three.js WebView, MapLibre&quot;]
+    WEB[&quot;Next.js Web (Vercel)&lt;br/&gt;SEO, booking, community&quot;]
+    PORTAL[&quot;Theatre Partner Portal (Next.js)&lt;br/&gt;Manual seat sync, CSV import&quot;]
+    ADMIN[&quot;Admin / Moderator Console&quot;]
+  end
+
+  subgraph Edge[&quot;Vercel + Supabase Edge Layer&quot;]
+    VAPI[&quot;Vercel Route Handlers&lt;br/&gt;/api/webhooks/payments&quot;]
+    EF_BOOK[&quot;EF: booking-orchestrator&lt;br/&gt;lock, order, confirm&quot;]
+    EF_SYNC[&quot;EF: sync-api&lt;br/&gt;manual + direct sync ingest&quot;]
+    EF_AI[&quot;EF: mascot-gateway&lt;br/&gt;LLM proxy, RAG, rate limit&quot;]
+    EF_MOD[&quot;EF: moderation-pipeline&lt;br/&gt;text filter, reports, bans&quot;]
+  end
+
+  subgraph Supabase
+    AUTH[&quot;Supabase Auth&lt;br/&gt;Google + Email&quot;]
+    PG[(&quot;Postgres + RLS&lt;br/&gt;pgvector, pg_cron&quot;)]
+    RT[&quot;Realtime&lt;br/&gt;Postgres Changes + Broadcast + Presence&quot;]
+    STORE[&quot;Storage&lt;br/&gt;posters, GLB models, PMTiles&quot;]
+    CRON[&quot;pg_cron&lt;br/&gt;lock expiry, reconciliation&quot;]
+  end
+
+  subgraph External
+    PSP[&quot;Payment Gateway&lt;br/&gt;UPI intent / collect&quot;]
+    LLM[&quot;LLM API (Claude)&quot;]
+    TMDB[&quot;Movie metadata API&quot;]
+    THEATRE_API[&quot;Theatre POS / Ticketing APIs&lt;br/&gt;(Phase 2 direct sync)&quot;]
+    TILES[&quot;OSM vector tiles&quot;]
+    PUSH[&quot;FCM / APNs&quot;]
+  end
+
+  RN --&gt; AUTH
+  WEB --&gt; AUTH
+  RN --&gt;|reads via RLS| PG
+  RN &lt;--&gt;|seat map, chat| RT
+  WEB &lt;--&gt; RT
+  RN --&gt; EF_BOOK
+  RN --&gt; EF_AI
+  RN --&gt; EF_MOD
+  RN --&gt; TILES
+  PORTAL --&gt; EF_SYNC
+  ADMIN --&gt; EF_MOD
+  EF_BOOK --&gt; PG
+  EF_BOOK --&gt; PSP
+  PSP --&gt;|signed webhook| VAPI --&gt; PG
+  EF_SYNC --&gt; PG
+  THEATRE_API -.-&gt;|adapter, Phase 2| EF_SYNC
+  EF_AI --&gt; LLM
+  EF_AI --&gt; PG
+  EF_MOD --&gt; PG
+  PG --&gt; RT
+  CRON --&gt; PG
+  PG --&gt;|DB webhook| PUSH
+  TMDB --&gt; PG
+  STORE --&gt; RN
+</pre>
+<h3>Booking flow (seat lock, pay, confirm)</h3>
+<pre class="mermaid">sequenceDiagram
+  participant U as App
+  participant EF as booking-orchestrator
+  participant DB as Postgres
+  participant PSP as Gateway (UPI)
+  participant WH as Vercel webhook
+  U-&gt;&gt;EF: POST /lock {showtime_id, seat_ids[]}
+  EF-&gt;&gt;DB: rpc lock_seats() (atomic, 8 min TTL)
+  DB--&gt;&gt;U: Realtime: seats -&gt; LOCKED (everyone sees it)
+  EF-&gt;&gt;PSP: create order (amount, booking_id)
+  EF--&gt;&gt;U: order_id + UPI intent payload
+  U-&gt;&gt;PSP: pay via UPI app
+  PSP-&gt;&gt;WH: webhook payment.captured (HMAC signed)
+  WH-&gt;&gt;DB: rpc confirm_booking() (idempotent)
+  DB--&gt;&gt;U: Realtime: seats -&gt; SOLD, ticket QR issued
+  Note over DB: pg_cron releases expired locks every 30s
+</pre>
+<h2 id="s2">2. Database schema (Supabase / Postgres)</h2>
+<pre><code class="language-sql">create extension if not exists &quot;pgcrypto&quot;;
+create extension if not exists vector;
+create extension if not exists pg_cron;
+create extension if not exists postgis;
+
+-- ENUMS
+create type user_role      as enum ('user','moderator','theatre_manager','admin');
+create type seat_status    as enum ('available','locked','sold','blocked','offline_sold');
+create type booking_status as enum ('pending','confirmed','cancelled','expired','refunded');
+create type payment_status as enum ('created','captured','failed','refunded');
+create type inventory_mode as enum ('manual','direct_api');
+create type sync_source    as enum ('app','manual_portal','csv','direct_api');
+create type spec_verification as enum ('unverified','theatre_claimed','mindstor_verified');
+
+-- USERS
+create table profiles (
+  id uuid primary key references auth.users(id) on delete cascade,
+  display_name text not null,
+  avatar_url text,
+  role user_role not null default 'user',
+  home_city text,
+  favorite_formats text[] default '{}',          -- e.g. {'IMAX','Dolby Cinema'}
+  chat_banned_until timestamptz,
+  created_at timestamptz default now()
+);
+
+-- THEATRES / SCREENS
+create table theatres (
+  id uuid primary key default gen_random_uuid(),
+  name text not null,
+  chain text,
+  city text not null,
+  address text,
+  geo geography(point,4326) not null,
+  inventory_mode inventory_mode not null default 'manual',
+  sync_api_config jsonb,                          -- encrypted ref for Phase 2 adapters
+  owner_org_id uuid,
+  is_active boolean default true
+);
+create index on theatres using gist(geo);
+
+create table theatre_staff (
+  theatre_id uuid references theatres on delete cascade,
+  user_id uuid references profiles on delete cascade,
+  primary key (theatre_id, user_id)
+);
+
+create table projector_models (
+  id uuid primary key default gen_random_uuid(),
+  brand text not null,                            -- Christie, Barco, NEC
+  model text not null,                            -- e.g. 'CP4325-RGB'
+  technology text,                                -- Xenon, RGB Laser, Laser Phosphor
+  max_brightness_lumens int,
+  native_resolution text,                         -- 2K, 4K
+  unique (brand, model)
+);
+
+create table audio_systems (
+  id uuid primary key default gen_random_uuid(),
+  name text unique not null,                      -- Dolby Atmos, DTS:X, Barco AuroMax
+  max_channels int
+);
+
+create table screens (
+  id uuid primary key default gen_random_uuid(),
+  theatre_id uuid not null references theatres on delete cascade,
+  name text not null,
+  format text,                                    -- IMAX, 4DX, Standard, Dolby Cinema
+  capacity int not null,
+  layout_version int not null default 1,
+  model_3d_url text,                              -- GLB in Storage
+  unique (theatre_id, name)
+);
+
+-- verified, comparable specs (1:1 with screens)
+create table screen_specs (
+  screen_id uuid primary key references screens on delete cascade,
+  projector_model_id uuid references projector_models,
+  audio_system_id uuid references audio_systems,
+  screen_width_m numeric(5,2),
+  screen_height_m numeric(5,2),
+  aspect_ratio text,                              -- 1.43:1, 1.90:1, 2.39:1
+  screen_gain numeric(3,2),
+  is_curved boolean default false,
+  max_resolution text,
+  frame_rate_max int,
+  hdr_support text,                               -- none, HDR10, Dolby Vision
+  speaker_count int,
+  seat_type text,                                 -- recliner, standard
+  verification spec_verification default 'unverified',
+  verified_by uuid references profiles,
+  verified_at timestamptz,
+  evidence_urls text[] default '{}',
+  updated_at timestamptz default now()
+);
+
+-- Comparison logic: normalized score view
+create view screen_comparison as
+select s.id as screen_id, t.name as theatre, s.name as screen, s.format,
+  sp.screen_width_m, sp.screen_height_m,
+  round(sp.screen_width_m*sp.screen_height_m,1) as screen_area_m2,
+  pm.brand, pm.model, pm.technology, pm.max_brightness_lumens,
+  sp.max_resolution, a.name as audio, sp.verification,
+  (coalesce(sp.screen_width_m*sp.screen_height_m,0)/2
+   + (case pm.technology when 'RGB Laser' then 30 when 'Laser Phosphor' then 22 else 10 end)
+   + (case when a.name ilike '%Atmos%' then 15 else 5 end)
+   + (case sp.verification when 'mindstor_verified' then 5 else 0 end)) as quality_score
+from screens s
+join theatres t on t.id=s.theatre_id
+left join screen_specs sp on sp.screen_id=s.id
+left join projector_models pm on pm.id=sp.projector_model_id
+left join audio_systems a on a.id=sp.audio_system_id;
+-- App calls: select * from screen_comparison where screen_id = any($1) -&gt; renders side-by-side
+
+-- SEATS (static layout)
+create table seats (
+  id uuid primary key default gen_random_uuid(),
+  screen_id uuid not null references screens on delete cascade,
+  row_label text not null,
+  seat_number int not null,
+  tier text default 'standard',                   -- standard, premium, recliner
+  x numeric, y numeric, z numeric,                -- for 2D map and three.js
+  is_accessible boolean default false,
+  unique (screen_id, row_label, seat_number)
+);
+
+-- MOVIES / SHOWTIMES
+create table movies (
+  id uuid primary key default gen_random_uuid(),
+  tmdb_id int unique,
+  title text not null,
+  synopsis text,
+  language text, runtime_min int,
+  certificate text,                               -- U, UA, A
+  genres text[], director text, cast_members text[],
+  poster_url text, trailer_url text,
+  release_date date,
+  embedding vector(1536)                          -- mascot recommendations
+);
+
+create table showtimes (
+  id uuid primary key default gen_random_uuid(),
+  movie_id uuid not null references movies,
+  screen_id uuid not null references screens,
+  starts_at timestamptz not null,
+  ends_at timestamptz not null,
+  language text, format text, subtitle text,
+  base_price_paise int not null,
+  tier_prices jsonb default '{}',
+  convenience_fee_paise int default 0,            -- the low-fee differentiator
+  status text default 'scheduled',
+  unique (screen_id, starts_at)
+);
+create index on showtimes (movie_id, starts_at);
+
+-- PER-SHOW SEAT INVENTORY (source of truth for availability)
+create table showtime_seats (
+  showtime_id uuid references showtimes on delete cascade,
+  seat_id uuid references seats,
+  status seat_status not null default 'available',
+  locked_by uuid references profiles,
+  locked_until timestamptz,
+  booking_id uuid,
+  price_paise int not null,
+  source sync_source default 'app',
+  version bigint not null default 0,              -- optimistic concurrency for sync
+  updated_at timestamptz default now(),
+  primary key (showtime_id, seat_id)
+);
+create index on showtime_seats (showtime_id, status);
+create index on showtime_seats (locked_until) where status='locked';
+
+-- BOOKINGS / TICKETS / PAYMENTS
+create table bookings (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references profiles,
+  showtime_id uuid not null references showtimes,
+  status booking_status not null default 'pending',
+  subtotal_paise int not null,
+  fee_paise int not null default 0,
+  total_paise int generated always as (subtotal_paise + fee_paise) stored,
+  expires_at timestamptz not null,
+  created_at timestamptz default now()
+);
+
+create table tickets (
+  id uuid primary key default gen_random_uuid(),
+  booking_id uuid not null references bookings on delete cascade,
+  showtime_id uuid not null,
+  seat_id uuid not null,
+  qr_token text unique not null,                  -- signed, rotating JWT
+  checked_in_at timestamptz,
+  unique (showtime_id, seat_id)                   -- hard guard against double-sell
+);
+
+create table payments (
+  id uuid primary key default gen_random_uuid(),
+  booking_id uuid not null references bookings,
+  gateway text not null,
+  gateway_order_id text unique,
+  gateway_payment_id text unique,                 -- idempotency key for webhooks
+  method text default 'upi',
+  amount_paise int not null,
+  status payment_status default 'created',
+  raw_webhook jsonb,
+  created_at timestamptz default now()
+);
+
+-- CHAT + MODERATION
+create table chat_rooms (
+  id uuid primary key default gen_random_uuid(),
+  slug text unique not null,                      -- 'global','city-kochi','movie-&lt;id&gt;'
+  kind text not null,                             -- global | city | movie | genre
+  movie_id uuid references movies,
+  is_slow_mode boolean default false,
+  slow_mode_seconds int default 0,
+  is_locked boolean default false
+);
+
+create table chat_messages (
+  id bigint generated always as identity primary key,
+  room_id uuid not null references chat_rooms on delete cascade,
+  user_id uuid not null references profiles,
+  body text not null check (char_length(body) between 1 and 1000),
+  reply_to bigint references chat_messages,
+  spoiler boolean default false,
+  is_deleted boolean default false,
+  deleted_by uuid references profiles,
+  created_at timestamptz default now()
+);
+create index on chat_messages (room_id, created_at desc);
+
+create table chat_reports (
+  id uuid primary key default gen_random_uuid(),
+  message_id bigint references chat_messages,
+  reporter_id uuid references profiles,
+  reason text, status text default 'open',
+  resolved_by uuid references profiles, created_at timestamptz default now()
+);
+
+create table moderation_actions (
+  id uuid primary key default gen_random_uuid(),
+  target_user_id uuid references profiles,
+  moderator_id uuid references profiles,
+  action text not null,                           -- warn | mute | ban | delete_msg
+  reason text, expires_at timestamptz, created_at timestamptz default now()
+);
+
+-- ATOMIC SEAT LOCK (never lock from the client)
+create or replace function lock_seats(p_showtime uuid, p_seats uuid[], p_user uuid, p_ttl interval default '8 minutes')
+returns setof showtime_seats language plpgsql security definer as $$
+declare n int;
+begin
+  perform 1 from showtime_seats
+   where showtime_id=p_showtime and seat_id=any(p_seats)
+   order by seat_id for update;                   -- deterministic order avoids deadlocks
+
+  update showtime_seats set status='locked', locked_by=p_user,
+         locked_until=now()+p_ttl, version=version+1, updated_at=now()
+   where showtime_id=p_showtime and seat_id=any(p_seats)
+     and (status='available' or (status='locked' and locked_until&lt;now()));
+  get diagnostics n = row_count;
+  if n &lt;&gt; array_length(p_seats,1) then
+    raise exception 'SEATS_UNAVAILABLE' using errcode='P0001';  -- rolls back partial lock
+  end if;
+  return query select * from showtime_seats where showtime_id=p_showtime and seat_id=any(p_seats);
+end $$;
+
+-- Lock expiry sweep
+select cron.schedule('release-locks','30 seconds',
+ $$update showtime_seats set status='available', locked_by=null, locked_until=null, version=version+1
+   where status='locked' and locked_until&lt;now()$$);
+
+-- RLS (essentials)
+alter table profiles enable row level security;
+alter table chat_messages enable row level security;
+alter table bookings enable row level security;
+alter table showtime_seats enable row level security;
+
+create policy &quot;profiles readable&quot; on profiles for select using (true);
+create policy &quot;own profile update&quot; on profiles for update using (auth.uid()=id);
+create policy &quot;chat read&quot; on chat_messages for select using (not is_deleted);
+create policy &quot;chat insert&quot; on chat_messages for insert with check (
+  auth.uid()=user_id and not exists
+  (select 1 from profiles p where p.id=auth.uid() and p.chat_banned_until&gt;now()));
+create policy &quot;own bookings&quot; on bookings for select using (auth.uid()=user_id);
+create policy &quot;seat map public read&quot; on showtime_seats for select using (true);
+-- all seat/booking writes go through security-definer RPCs or service role only
+</code></pre>
+<p><strong>Realtime usage:</strong> <code>showtime_seats</code> via Postgres Changes, filtered by <code>showtime_id</code>. For hot shows, prefer Broadcast triggered from the RPC. Chat uses Postgres Changes on <code>chat_messages</code> plus Presence for online counts. Past roughly 5k concurrent users in one room, switch the global room to Broadcast with async persistence.</p>
+<p><strong>Chat moderation layers:</strong>
+1. Client-side slow mode and rate limits.
+2. <code>moderation-pipeline</code> Edge Function with a profanity and toxicity filter (LLM or classifier) via a DB webhook, which soft-deletes and logs.
+3. Report queue for moderators.
+4. Mute and ban through <code>moderation_actions</code>, which sets <code>chat_banned_until</code>.</p>
+<h2 id="s3">3. Manual seat sync fallback API (MVP)</h2>
+<p>Base: <code>https://&lt;project&gt;.supabase.co/functions/v1/sync-api/v1</code></p>
+<p><strong>Auth:</strong> a Supabase JWT with the <code>theatre_manager</code> role. The manager must be in <code>theatre_staff</code>, enforced in the function. Phase 2 direct sync adds <code>X-Mindstor-Key</code> plus <code>X-Signature: HMAC-SHA256(body)</code>, with the same endpoints. All writes require an <code>Idempotency-Key</code> header.</p>
+<p><strong>Rules:</strong>
+- Writes call <code>apply_seat_changes()</code>, which uses the <code>version</code> column for optimistic concurrency.
+- Live app locks win over manual <code>available</code> writes.
+- Every call is logged to a <code>sync_events</code> audit table.</p>
+<table>
+<thead>
+<tr>
+<th>Method</th>
+<th>Endpoint</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>GET</td>
+<td><code>/theatres/{tid}/showtimes?date=YYYY-MM-DD</code></td>
+<td>List the day's shows with seat counts</td>
+</tr>
+<tr>
+<td>GET</td>
+<td><code>/showtimes/{sid}/seats</code></td>
+<td>Full seat state including <code>version</code></td>
+</tr>
+<tr>
+<td>POST</td>
+<td><code>/showtimes/{sid}/seats/bulk</code></td>
+<td>Apply a batch of seat state changes</td>
+</tr>
+<tr>
+<td>POST</td>
+<td><code>/showtimes/{sid}/offline-sales</code></td>
+<td>Record counter and walk-in sales (<code>offline_sold</code>)</td>
+</tr>
+<tr>
+<td>POST</td>
+<td><code>/showtimes/{sid}/block</code></td>
+<td>Block seats (maintenance, comp, house seats)</td>
+</tr>
+<tr>
+<td>POST</td>
+<td><code>/showtimes/{sid}/release</code></td>
+<td>Release blocked seats</td>
+</tr>
+<tr>
+<td>PUT</td>
+<td><code>/showtimes/{sid}/snapshot</code></td>
+<td>Replace inventory with the theatre's end-of-day truth (diff returned)</td>
+</tr>
+<tr>
+<td>POST</td>
+<td><code>/theatres/{tid}/import/csv</code></td>
+<td>Upload a showtime or seat CSV (multipart, dry-run supported)</td>
+</tr>
+<tr>
+<td>POST</td>
+<td><code>/theatres/{tid}/heartbeat</code></td>
+<td>Manager portal liveness, used for stale-data warnings</td>
+</tr>
+<tr>
+<td>GET</td>
+<td><code>/theatres/{tid}/reconciliation?date=</code></td>
+<td>Mindstor sales vs. theatre-reported sales</td>
+</tr>
+</tbody>
+</table>
+<h3>Examples</h3>
+<p><code>POST /showtimes/{sid}/seats/bulk</code></p>
+<pre><code class="language-json">// Headers: Authorization: Bearer &lt;jwt&gt;, Idempotency-Key: 7c1e...
+{
+  &quot;source&quot;: &quot;manual_portal&quot;,
+  &quot;changes&quot;: [
+    { &quot;seat&quot;: &quot;F12&quot;, &quot;status&quot;: &quot;offline_sold&quot;, &quot;expected_version&quot;: 4 },
+    { &quot;seat&quot;: &quot;F13&quot;, &quot;status&quot;: &quot;offline_sold&quot;, &quot;expected_version&quot;: 2 },
+    { &quot;seat&quot;: &quot;A1&quot;,  &quot;status&quot;: &quot;blocked&quot;, &quot;reason&quot;: &quot;projector obstruction&quot; }
+  ]
+}
+</code></pre>
+<pre><code class="language-json">// 200 (207 if partial)
+{
+  &quot;applied&quot;: 2,
+  &quot;conflicts&quot;: [
+    { &quot;seat&quot;: &quot;F13&quot;, &quot;reason&quot;: &quot;LOCKED_BY_APP&quot;, &quot;current_status&quot;: &quot;locked&quot;, &quot;current_version&quot;: 3 }
+  ],
+  &quot;rejected&quot;: [],
+  &quot;sync_event_id&quot;: &quot;evt_01J...&quot;
+}
+</code></pre>
+<p><code>POST /showtimes/{sid}/offline-sales</code></p>
+<pre><code class="language-json">{ &quot;seats&quot;: [&quot;G5&quot;,&quot;G6&quot;], &quot;sold_at&quot;: &quot;2026-10-04T18:42:00+05:30&quot;, &quot;counter_ref&quot;: &quot;POS-88231&quot; }
+</code></pre>
+<p><code>PUT /showtimes/{sid}/snapshot</code></p>
+<pre><code class="language-json">{ &quot;source&quot;: &quot;manual_portal&quot;,
+  &quot;sold_seats&quot;: [&quot;F12&quot;,&quot;F13&quot;,&quot;G5&quot;,&quot;G6&quot;], &quot;blocked_seats&quot;: [&quot;A1&quot;] }
+</code></pre>
+<p>Response includes <code>diff: { newly_marked, released, conflicts_with_online_bookings }</code>. The last field is a priority alert: any seat sold online and also marked sold offline needs a manual resolution.</p>
+<p><strong>Errors:</strong> <code>400 VALIDATION</code>, <code>401</code>, <code>403 NOT_THEATRE_STAFF</code>, <code>404</code>, <code>409 VERSION_CONFLICT / LOCKED_BY_APP / DUPLICATE_BOOKING</code>, <code>422 SHOW_STARTED</code>, <code>429</code>.</p>
+<p><strong>MVP operating model:</strong>
+1. Theatre staff open the portal on a tablet at the box office. The seat map shows the live state.
+2. They mark counter sales as they happen, or upload a snapshot every N minutes.
+3. A "last synced" badge appears in the app. If sync is stale for more than 15 minutes, a warning is shown and online sales for that show stop.
+4. Daily reconciliation and settlement report.</p>
+<p><strong>Phase 2 direct API:</strong> write a <code>TheatreAdapter</code> interface (<code>fetchSeats</code>, <code>pushHold</code>, <code>confirmSale</code>, <code>release</code>). Each theatre system gets one adapter, selected by <code>theatres.inventory_mode</code>. The booking-orchestrator calls the adapter before confirming so the seat is held upstream too.</p>
+<h2 id="s4">4. Monorepo structure (pnpm + Turborepo)</h2>
+<pre><code>mindstor/
+├── apps/
+│   ├── mobile/                      # Expo React Native
+│   │   ├── app/                     # expo-router: (tabs)/home, movie/[id], book/[showtimeId], chat, mascot, profile
+│   │   ├── src/features/            # booking, screens-compare, chat, mascot, map, tickets
+│   │   ├── src/lib/                 # supabase client, query client (TanStack), analytics
+│   │   └── app.config.ts
+│   ├── web/                         # Next.js (Vercel): public site, booking, community
+│   │   ├── app/
+│   │   └── app/api/webhooks/payments/route.ts   # signed gateway webhook
+│   ├── partner-portal/              # Next.js: theatre manual sync UI, CSV import, reports
+│   └── admin/                       # Next.js: moderation, spec verification, content
+├── packages/
+│   ├── ui/                          # shared design tokens + RN/web components
+│   ├── seat-viewer/                 # three.js: SeatScene, loaders, picking, WebView bridge
+│   ├── api-client/                  # typed SDK wrapping Supabase + Edge Functions
+│   ├── db-types/                    # generated: supabase gen types typescript
+│   ├── schemas/                     # Zod schemas shared by client + Edge Functions
+│   ├── screen-compare/              # comparison and scoring logic (pure TS, unit tested)
+│   ├── theatre-adapters/            # TheatreAdapter interface, manual + (future) vendor adapters
+│   └── config/                      # eslint, tsconfig, prettier presets
+├── supabase/
+│   ├── migrations/                  # 0001_init.sql, 0002_rls.sql, 0003_rpc.sql, ...
+│   ├── functions/
+│   │   ├── booking-orchestrator/
+│   │   ├── sync-api/
+│   │   ├── mascot-gateway/
+│   │   ├── moderation-pipeline/
+│   │   └── _shared/                 # auth, idempotency, errors, logger
+│   ├── seed/                        # projector_models, audio_systems, demo theatres
+│   ├── tests/                       # pgTAP: RLS, lock_seats concurrency
+│   └── config.toml
+├── tools/
+│   ├── seat-layout-importer/        # CSV/JSON -&gt; seats + GLB generator
+│   └── scripts/                     # tmdb-sync, load-test (k6) for seat locking
+├── .github/workflows/               # ci.yml (lint, test, typecheck), eas-build.yml, supabase-deploy.yml
+├── docs/                            # ADRs, runbooks, this document
+├── turbo.json
+├── pnpm-workspace.yaml
+└── package.json
+</code></pre>
+<p><strong>Build order for the team:</strong>
+1. <code>supabase/migrations</code> and <code>db-types</code>, then <code>lock_seats</code> with a concurrency test (100 parallel lockers on one seat, exactly one wins).
+2. <code>sync-api</code> plus the partner portal. Inventory exists before consumers do.
+3. Mobile booking flow, 2D seat map first, then payments sandbox end to end.
+4. <code>screen-compare</code> and the spec admin workflow.
+5. three.js seat-view as an enhancement on the 2D picker.
+6. Chat and moderation.
+7. Mascot, once there is enough movie data for retrieval.</p>
+<h2 id="s5">5. Risks and mitigations</h2>
+<ul>
+<li><strong>Double selling (manual sync):</strong> the <code>unique (showtime_id, seat_id)</code> constraint on <code>tickets</code>, a stale-sync cutoff, and daily reconciliation.</li>
+<li><strong>Payment drift:</strong> webhooks are idempotent on <code>gateway_payment_id</code>. A cron job polls the gateway for <code>pending</code> bookings older than 10 minutes.</li>
+<li><strong>Seat-map load spikes:</strong> subscribe only to the active <code>showtime_id</code>, use Broadcast for hot shows, and add Supabase compute add-ons before launches.</li>
+<li><strong>UPI on mobile:</strong> use intent flows for GPay, PhonePe and Paytm, and handle the app-resume-after-pay race by polling booking status.</li>
+<li><strong>Spec credibility:</strong> show a verification badge, and only <code>mindstor_verified</code> specs count in comparison scoring and filters. Keep evidence URLs.</li>
+<li><strong>AI cost and abuse:</strong> rate-limit per user, cap tokens, and ground answers in your own tables to limit hallucinated showtimes. The mascot never quotes prices or availability from the model.</li>
+<li><strong>Chat abuse:</strong> layered moderation (section 2), plus a trust level for new accounts (for example, no links for 24 hours).</li>
+<li><strong>OSM tiles:</strong> self-host or buy tiles, and attribute OpenStreetMap contributors in the app.</li>
+</ul>
+</main></div>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
+<script>
+if(window.mermaid){
+  var dark=matchMedia('(prefers-color-scheme: dark)').matches;
+  mermaid.initialize({startOnLoad:true,theme:dark?'dark':'default',securityLevel:'loose'});
+}
+</script>
+</body></html>
